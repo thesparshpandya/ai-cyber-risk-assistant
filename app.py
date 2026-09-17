@@ -1,25 +1,3 @@
-"""
-app.py — TawasolPay Executive Cyber Risk Dashboard.
-
-A Streamlit front end over `backend.py`. This module renders only; it never
-scores, ranks, or reorders anything. Every number shown here comes from the
-deterministic engine, and every NIST control shown was retrieved from the
-catalogue rather than generated.
-
-UI approach
------------
-Native Streamlit components (`st.metric`, `st.columns`, `st.container(border=True)`,
-`st.expander`) do the structural layout, so spacing, wrapping and responsiveness are
-handled by Streamlit itself rather than by hand-rolled HTML that breaks on version
-upgrades. Custom CSS is scoped to a handful of project-defined classes (`tp-badge`,
-`tp-driver`, `tp-why`) for the small number of visual elements Streamlit has no
-native equivalent for — it never targets Streamlit's internal DOM structure or
-generated class names, which is what causes text like raw arrow glyphs or class
-names to leak into the rendered page when an internal name changes.
-
-Run with:  streamlit run app.py
-"""
-
 from __future__ import annotations
 
 import os
@@ -31,17 +9,13 @@ import streamlit as st
 import backend
 from backend import Risk, RiskReport, SchemaValidationError
 
-try:  # Plotly gives the requested executive-style charts; the app must not depend on it.
+try:
     import plotly.graph_objects as go
 
     PLOTLY = True
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     PLOTLY = False
 
-
-# ---------------------------------------------------------------------------
-# Page setup and theme
-# ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="TawasolPay — Cyber Risk Assistant",
@@ -50,12 +24,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-BG = "#0e1117"
-CARD_BG = "#161b22"
-BORDER = "#30363d"
-INK = "#e6edf7"
-MUTED = "#8b949e"
-
 SEVERITY_COLORS: Dict[str, str] = {
     "CRITICAL": "#ef4444",
     "HIGH": "#f97316",
@@ -63,9 +31,6 @@ SEVERITY_COLORS: Dict[str, str] = {
     "LOW": "#22c55e",
 }
 
-# Streamlit renamed the container-width argument in 1.49 and deprecated the old
-# spelling. Feature-detect once so the dashboard runs clean on either generation,
-# rather than hand-writing width CSS that would need to track internal markup.
 try:
     from packaging.version import Version
 
@@ -76,75 +41,313 @@ try:
 except Exception:
     _STRETCH = {"use_container_width": True}
 
-# Scoped, project-owned CSS only. Every selector below is a class this file itself
-# applies via `unsafe_allow_html=True`, or `.stApp`/`[data-testid="stSidebar"]`,
-# which are documented, stable Streamlit theming hooks — nothing here reaches into
-# Streamlit's internal component markup (no `.st-*` utility classes, no
-# `:before`/`:after` pseudo-element overrides on framework-generated icons).
-CSS = f"""
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = True
+
+toggle_cols = st.columns([6, 2])
+with toggle_cols[1]:
+    st.session_state.dark_mode = st.toggle(
+        "🌙 Dark Mode" if st.session_state.dark_mode else "☀️ Light Mode",
+        value=st.session_state.dark_mode,
+        key="theme_toggle_control",
+        help="Switch between high-contrast Dark Mode and Light Mode.",
+    )
+
+DARK_MODE = st.session_state.dark_mode
+
+DARK_CSS = """
 <style>
-.stApp {{ background-color: {BG}; }}
-[data-testid="stSidebar"] {{ background-color: #11161f; border-right: 1px solid {BORDER}; }}
-
-.tp-badge {{
-  display: inline-block;
-  padding: 0.2rem 0.7rem;
-  border-radius: 999px;
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  border: 1px solid currentColor;
-  line-height: 1.6;
-}}
-.tp-badge.critical {{ color: {SEVERITY_COLORS['CRITICAL']}; background: rgba(239, 68, 68, 0.12); }}
-.tp-badge.high     {{ color: {SEVERITY_COLORS['HIGH']};     background: rgba(249, 115, 22, 0.12); }}
-.tp-badge.medium   {{ color: {SEVERITY_COLORS['MEDIUM']};   background: rgba(234, 179, 8, 0.12); }}
-.tp-badge.low      {{ color: {SEVERITY_COLORS['LOW']};      background: rgba(34, 197, 94, 0.12); }}
-
-.tp-driver-row {{
-  display: flex;
-  align-items: baseline;
-  gap: 0.5rem;
-  padding: 0.3rem 0;
-  border-bottom: 1px solid {BORDER};
-  font-size: 0.86rem;
-}}
-.tp-driver-row:last-child {{ border-bottom: none; }}
-.tp-driver-row .mark {{ width: 1.1rem; flex-shrink: 0; color: {SEVERITY_COLORS['LOW']}; }}
-.tp-driver-row.off .mark {{ color: {MUTED}; }}
-.tp-driver-row.off {{ color: {MUTED}; }}
-.tp-driver-row .label {{ flex: 1 1 auto; }}
-.tp-driver-row .mult {{ color: {MUTED}; font-variant-numeric: tabular-nums; }}
-.tp-driver-evidence {{ color: {MUTED}; font-size: 0.76rem; padding: 0 0 0.3rem 1.6rem; }}
-
-.tp-why {{
-  border-left: 3px solid #3d5a8a;
-  background: rgba(61, 90, 138, 0.10);
-  border-radius: 0 8px 8px 0;
-  padding: 0.75rem 1rem;
-  font-size: 0.92rem;
-  line-height: 1.6;
-}}
-
-.tp-prov {{
-  display: inline-block;
-  font-size: 0.7rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 4px;
-  border: 1px solid {BORDER};
-  color: {MUTED};
-}}
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background-color: #0e1117 !important;
+    color: #e0e6ed !important;
+}
+[data-testid="stHeader"] {
+    background-color: rgba(0,0,0,0) !important;
+}
+[data-testid="stSidebar"] {
+    background-color: #11161f !important;
+    border-right: 1px solid #30363d !important;
+}
+[data-testid="stSidebar"] * {
+    color: #e0e6ed !important;
+}
+h1, h2, h3, h4, h5, h6 {
+    color: #ffffff !important;
+}
+p, span, li, label, div, a {
+    color: #e0e6ed !important;
+}
+[data-testid="stMarkdownContainer"] {
+    color: #e0e6ed !important;
+}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span,
+[data-testid="stMarkdownContainer"] strong,
+[data-testid="stMarkdownContainer"] em {
+    color: #e0e6ed !important;
+}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p,
+[data-testid="stCaptionContainer"] span,
+small {
+    color: #a8b3c2 !important;
+}
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] label {
+    color: #e0e6ed !important;
+}
+[data-testid="stMetric"] {
+    background-color: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 10px !important;
+    padding: 0.9rem 1rem !important;
+}
+[data-testid="stMetricValue"] {
+    color: #ffffff !important;
+}
+[data-testid="stMetricLabel"] {
+    color: #a8b3c2 !important;
+}
+[data-testid="stMetricDelta"] {
+    color: #a8b3c2 !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background-color: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 10px !important;
+}
+[data-testid="stExpander"] {
+    background-color: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 10px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #e0e6ed !important;
+}
+[data-testid="stExpander"] p {
+    color: #e0e6ed !important;
+}
+[data-testid="stDataFrame"] {
+    background-color: #161b22 !important;
+    border: 1px solid #30363d !important;
+}
+hr {
+    border-color: #30363d !important;
+}
+[data-testid="stAlertContentInfo"],
+[data-testid="stAlertContentWarning"],
+[data-testid="stAlertContentError"],
+[data-testid="stAlertContentSuccess"] {
+    color: #0e1117 !important;
+}
+.tp-badge {
+    display: inline-block;
+    padding: 0.2rem 0.7rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    border: 1px solid currentColor;
+    line-height: 1.6;
+}
+.tp-badge.critical { color: #ef4444 !important; background: rgba(239, 68, 68, 0.16) !important; }
+.tp-badge.high     { color: #f97316 !important; background: rgba(249, 115, 22, 0.16) !important; }
+.tp-badge.medium   { color: #eab308 !important; background: rgba(234, 179, 8, 0.16) !important; }
+.tp-badge.low      { color: #22c55e !important; background: rgba(34, 197, 94, 0.16) !important; }
+.tp-driver-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.3rem 0;
+    border-bottom: 1px solid #30363d;
+    font-size: 0.86rem;
+}
+.tp-driver-row:last-child { border-bottom: none; }
+.tp-driver-row .mark { width: 1.1rem; flex-shrink: 0; color: #22c55e !important; }
+.tp-driver-row.off .mark { color: #a8b3c2 !important; }
+.tp-driver-row .label { flex: 1 1 auto; color: #e0e6ed !important; }
+.tp-driver-row.off .label { color: #a8b3c2 !important; }
+.tp-driver-row .mult { color: #a8b3c2 !important; font-variant-numeric: tabular-nums; }
+.tp-driver-evidence { color: #a8b3c2 !important; font-size: 0.76rem; padding: 0 0 0.3rem 1.6rem; }
+.tp-why {
+    border-left: 3px solid #3d5a8a;
+    background: rgba(61, 90, 138, 0.14) !important;
+    border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem;
+    font-size: 0.92rem;
+    line-height: 1.6;
+    color: #e0e6ed !important;
+}
+.tp-prov {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #30363d;
+    color: #a8b3c2 !important;
+}
+.tp-asset-section, .tp-driver-section {
+    color: #e0e6ed !important;
+}
+.tp-asset-section p, .tp-driver-section p,
+.tp-asset-section span, .tp-driver-section span,
+.tp-asset-section div, .tp-driver-section div {
+    color: #e0e6ed !important;
+}
 </style>
 """
-st.markdown(CSS, unsafe_allow_html=True)
 
+LIGHT_CSS = """
+<style>
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background-color: #f6f8fa !important;
+    color: #24292f !important;
+}
+[data-testid="stHeader"] {
+    background-color: rgba(255,255,255,0) !important;
+}
+[data-testid="stSidebar"] {
+    background-color: #ffffff !important;
+    border-right: 1px solid #d0d7de !important;
+}
+[data-testid="stSidebar"] * {
+    color: #24292f !important;
+}
+h1, h2, h3, h4, h5, h6 {
+    color: #111827 !important;
+}
+p, span, li, label, div, a {
+    color: #24292f !important;
+}
+[data-testid="stMarkdownContainer"] {
+    color: #24292f !important;
+}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span,
+[data-testid="stMarkdownContainer"] strong,
+[data-testid="stMarkdownContainer"] em {
+    color: #24292f !important;
+}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p,
+[data-testid="stCaptionContainer"] span,
+small {
+    color: #57606a !important;
+}
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] label {
+    color: #24292f !important;
+}
+[data-testid="stMetric"] {
+    background-color: #ffffff !important;
+    border: 1px solid #d0d7de !important;
+    border-radius: 10px !important;
+    padding: 0.9rem 1rem !important;
+}
+[data-testid="stMetricValue"] {
+    color: #111827 !important;
+}
+[data-testid="stMetricLabel"] {
+    color: #57606a !important;
+}
+[data-testid="stMetricDelta"] {
+    color: #57606a !important;
+}
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background-color: #ffffff !important;
+    border: 1px solid #d0d7de !important;
+    border-radius: 10px !important;
+}
+[data-testid="stExpander"] {
+    background-color: #ffffff !important;
+    border: 1px solid #d0d7de !important;
+    border-radius: 10px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #24292f !important;
+}
+[data-testid="stExpander"] p {
+    color: #24292f !important;
+}
+[data-testid="stDataFrame"] {
+    background-color: #ffffff !important;
+    border: 1px solid #d0d7de !important;
+}
+hr {
+    border-color: #d0d7de !important;
+}
+[data-testid="stAlertContentInfo"],
+[data-testid="stAlertContentWarning"],
+[data-testid="stAlertContentError"],
+[data-testid="stAlertContentSuccess"] {
+    color: #111827 !important;
+}
+.tp-badge {
+    display: inline-block;
+    padding: 0.2rem 0.7rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    border: 1px solid currentColor;
+    line-height: 1.6;
+}
+.tp-badge.critical { color: #b91c1c !important; background: rgba(239, 68, 68, 0.14) !important; }
+.tp-badge.high     { color: #c2410c !important; background: rgba(249, 115, 22, 0.14) !important; }
+.tp-badge.medium   { color: #a16207 !important; background: rgba(234, 179, 8, 0.16) !important; }
+.tp-badge.low      { color: #15803d !important; background: rgba(34, 197, 94, 0.14) !important; }
+.tp-driver-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.3rem 0;
+    border-bottom: 1px solid #d0d7de;
+    font-size: 0.86rem;
+}
+.tp-driver-row:last-child { border-bottom: none; }
+.tp-driver-row .mark { width: 1.1rem; flex-shrink: 0; color: #15803d !important; }
+.tp-driver-row.off .mark { color: #57606a !important; }
+.tp-driver-row .label { flex: 1 1 auto; color: #24292f !important; }
+.tp-driver-row.off .label { color: #57606a !important; }
+.tp-driver-row .mult { color: #57606a !important; font-variant-numeric: tabular-nums; }
+.tp-driver-evidence { color: #57606a !important; font-size: 0.76rem; padding: 0 0 0.3rem 1.6rem; }
+.tp-why {
+    border-left: 3px solid #3d5a8a;
+    background: rgba(61, 90, 138, 0.08) !important;
+    border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem;
+    font-size: 0.92rem;
+    line-height: 1.6;
+    color: #24292f !important;
+}
+.tp-prov {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #d0d7de;
+    color: #57606a !important;
+}
+.tp-asset-section, .tp-driver-section {
+    color: #24292f !important;
+}
+.tp-asset-section p, .tp-driver-section p,
+.tp-asset-section span, .tp-driver-section span,
+.tp-asset-section div, .tp-driver-section div {
+    color: #24292f !important;
+}
+</style>
+"""
 
-# ---------------------------------------------------------------------------
-# Small render helpers
-# ---------------------------------------------------------------------------
+st.markdown(DARK_CSS if DARK_MODE else LIGHT_CSS, unsafe_allow_html=True)
+
+CHART_TEXT = "#a8b3c2" if DARK_MODE else "#57606a"
+CHART_GRID = "#30363d" if DARK_MODE else "#d0d7de"
+
 
 def badge(severity: str) -> str:
-    """Severity pill markup — the one label style Streamlit has no native form for."""
     level = (severity or "LOW").upper()
     return f'<span class="tp-badge {level.lower()}">{level}</span>'
 
@@ -153,17 +356,8 @@ def yes_no(flag: bool) -> str:
     return "Yes" if flag else "No"
 
 
-# ---------------------------------------------------------------------------
-# Cached pipeline
-# ---------------------------------------------------------------------------
-
 @st.cache_resource(show_spinner=False)
 def load_report(data_dir: str, use_llm: bool, cache_token: int) -> RiskReport:
-    """
-    Run backend.generate_risk_report() once per (data_dir, use_llm) combination.
-
-    `cache_token` is bumped by the sidebar Reload button to force a rebuild.
-    """
     return backend.generate_risk_report(data_dir=data_dir, top_n=5, use_llm=use_llm)
 
 
@@ -173,10 +367,6 @@ def sorted_unique(frame: pd.DataFrame, column: str) -> List[str]:
     values = {str(v).strip() for v in frame[column].dropna().tolist() if str(v).strip()}
     return sorted(values)
 
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
 
 if "cache_token" not in st.session_state:
     st.session_state.cache_token = 0
@@ -212,7 +402,7 @@ except SchemaValidationError as exc:
         "known_exploited_vulnerabilities.json, NIST_SP-800-53_rev5_catalog_load.csv"
     )
     st.stop()
-except Exception as exc:  # unexpected failure — show it rather than a blank page
+except Exception as exc:
     st.error(f"Unexpected startup failure: {type(exc).__name__}: {exc}")
     st.stop()
 
@@ -262,18 +452,12 @@ filtered = tri_state(filtered, sel_kev, "kev_listed")
 filtered = tri_state(filtered, sel_campaign, "campaign_matches")
 
 top_five = filtered[:5]
-# Filtering can promote a risk that was not in the original Top 5, so retrieve
-# NIST guidance for anything newly surfaced before rendering its card.
 if top_five:
     with st.spinner("Retrieving NIST SP 800-53 guidance…"):
         report.enrich(top_five)
 
-
-# ---------------------------------------------------------------------------
-# Masthead
-# ---------------------------------------------------------------------------
-
-st.title("TawasolPay cyber risk position")
+with toggle_cols[0]:
+    st.title("TawasolPay cyber risk position")
 st.caption(
     "Composite risk across the asset estate, joined to CISA KEV, regional MDR campaign "
     "intelligence and business service context. Scores are computed deterministically in "
@@ -281,11 +465,6 @@ st.caption(
 )
 
 quality = report.quality
-
-
-# ---------------------------------------------------------------------------
-# KPI metrics row — native st.metric, no hand-built HTML boxes
-# ---------------------------------------------------------------------------
 
 kpi_cols = st.columns(4, gap="medium")
 
@@ -319,12 +498,7 @@ if not filtered:
 st.divider()
 
 
-# ---------------------------------------------------------------------------
-# Charts
-# ---------------------------------------------------------------------------
-
 def severity_chart(risks: Sequence[Risk]) -> None:
-    """Risk severity distribution, colored per the executive palette."""
     order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
     counts = {band: 0 for band in order}
     for risk in risks:
@@ -346,8 +520,8 @@ def severity_chart(risks: Sequence[Risk]) -> None:
             margin=dict(l=8, r=8, t=8, b=8),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color=MUTED, size=12),
-            yaxis=dict(gridcolor=BORDER, zerolinecolor=BORDER, title="Risks"),
+            font=dict(color=CHART_TEXT, size=12),
+            yaxis=dict(gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, title="Risks"),
             xaxis=dict(showgrid=False),
             showlegend=False,
         )
@@ -357,7 +531,6 @@ def severity_chart(risks: Sequence[Risk]) -> None:
 
 
 def driver_chart(risks: Sequence[Risk]) -> None:
-    """Active risk driver counts: Exposure, KEV, Campaign, Criticality, Missing EDR."""
     counts = backend.driver_counts_for(risks)
     labels = list(counts.keys())[::-1]
     values = [counts[label] for label in labels]
@@ -379,8 +552,8 @@ def driver_chart(risks: Sequence[Risk]) -> None:
             margin=dict(l=8, r=32, t=8, b=8),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color=MUTED, size=12),
-            xaxis=dict(gridcolor=BORDER, zerolinecolor=BORDER, title="Risks affected"),
+            font=dict(color=CHART_TEXT, size=12),
+            xaxis=dict(gridcolor=CHART_GRID, zerolinecolor=CHART_GRID, title="Risks affected"),
             yaxis=dict(showgrid=False),
             showlegend=False,
         )
@@ -402,12 +575,7 @@ with chart_cols[1]:
 st.divider()
 
 
-# ---------------------------------------------------------------------------
-# Top 5 risk cards
-# ---------------------------------------------------------------------------
-
 def render_drivers(risk: Risk) -> None:
-    """Multiplier lineage panel: active/inactive state, weight, and evidence."""
     rows: List[str] = []
     for factor in risk.factors:
         state_class = "" if factor.active else " off"
@@ -419,7 +587,7 @@ def render_drivers(risk: Risk) -> None:
             f'<span class="mult">×{factor.multiplier}</span></div>'
             f'<div class="tp-driver-evidence">{factor.evidence}</div>'
         )
-    st.markdown("".join(rows), unsafe_allow_html=True)
+    st.markdown(f'<div class="tp-driver-section">{"".join(rows)}</div>', unsafe_allow_html=True)
     st.caption(
         f"CVSS {risk.cvss:.1f} × "
         + " × ".join(f"{f.multiplier}" for f in risk.factors)
@@ -428,7 +596,6 @@ def render_drivers(risk: Risk) -> None:
 
 
 def render_nist(risk: Risk) -> None:
-    """Retrieved-control section in a distinct bordered container."""
     payload: Dict[str, Any] = risk.nist or {}
     control = payload.get("control")
     source_dataset = payload.get("source_dataset", backend.FILE_NIST)
@@ -489,7 +656,6 @@ def render_nist(risk: Risk) -> None:
 
 
 def render_risk_card(risk: Risk) -> None:
-    """One expandable Top 5 entry, built from native containers and columns."""
     title = (
         f"#{risk.rank}  ·  {risk.asset_name}  ·  {risk.cve_display}  ·  "
         f"score {risk.composite_score:.2f}  ·  {risk.severity_band}"
@@ -504,6 +670,7 @@ def render_risk_card(risk: Risk) -> None:
         left, right = st.columns(2, gap="large")
 
         with left:
+            st.markdown('<div class="tp-asset-section">', unsafe_allow_html=True)
             st.markdown("**Asset and threat context**")
             with st.container(border=True):
                 st.markdown(f"**Asset** — {risk.asset_name} ({risk.asset_id})")
@@ -537,8 +704,10 @@ def render_risk_card(risk: Risk) -> None:
                         "Data gap: service not defined in business_services.csv; "
                         "asset criticality used alone."
                     )
+            st.markdown("</div>", unsafe_allow_html=True)
 
         with right:
+            st.markdown('<div class="tp-driver-section">', unsafe_allow_html=True)
             st.markdown("**Risk drivers applied**")
             with st.container(border=True):
                 render_drivers(risk)
@@ -576,6 +745,7 @@ def render_risk_card(risk: Risk) -> None:
                         )
                 else:
                     st.caption("Threat intel feed: no campaign record matches this CVE.")
+            st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("**Why this ranks here**")
         st.markdown(f'<div class="tp-why">{risk.justification}</div>', unsafe_allow_html=True)
@@ -593,11 +763,6 @@ for risk in top_five:
     render_risk_card(risk)
 
 st.divider()
-
-
-# ---------------------------------------------------------------------------
-# Full register and diagnostics
-# ---------------------------------------------------------------------------
 
 with st.expander(f"Full risk register ({len(filtered)} rows)"):
     if filtered:
@@ -686,11 +851,6 @@ with st.expander("Regional campaigns parsed from the MDR advisory"):
         )
     else:
         st.caption("No campaigns were parsed, so the regional campaign multiplier never fired.")
-
-
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
 
 st.divider()
 st.caption(
