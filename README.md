@@ -172,7 +172,7 @@ Python 3.11 or newer.
 ### Install
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/thesparshpandya/ai-cyber-risk-assistant.git
 cd tawasolpay-cyber-risk-assistant
 
 python -m venv .venv
