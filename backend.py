@@ -21,11 +21,13 @@ to rewrite it. It cannot see, compute, alter, or reorder any score.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
 import os
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -959,6 +961,16 @@ class Risk:
     rank: int = 0
     nist: Optional[Dict[str, Any]] = None
 
+    # -- Tie-break-only fields ----------------------------------------------
+    # None of these three ever multiply into composite_score. They exist purely
+    # to break ties deterministically when composite_score alone leaves two or
+    # more risks equal, and they are computed once per risk in RiskEngine.score_all().
+    exploitability_score: float = 0.0
+    downstream_dependency_count: int = 0
+    remediation_effort_rank: int = 1
+    tie_break_source: Optional[str] = None
+    tie_break_note: Optional[str] = None
+
     # --- convenience accessors used by the UI -----------------------------
     @property
     def active_factors(self) -> List[RiskFactor]:
@@ -1009,6 +1021,11 @@ class Risk:
             "days_open": self.days_open,
             "threat_actors": ", ".join(self.threat_actors),
             "campaigns": ", ".join(self.campaign_names),
+            "exploitability_score": self.exploitability_score,
+            "downstream_dependency_count": self.downstream_dependency_count,
+            "remediation_effort_rank": self.remediation_effort_rank,
+            "tie_break_source": self.tie_break_source or "",
+            "tie_break_note": self.tie_break_note or "",
         }
 
 
@@ -1069,6 +1086,90 @@ def _build_justification(risk_parts: Dict[str, Any]) -> str:
     return head + body + "."
 
 
+def build_service_dependents_graph(services: pd.DataFrame) -> Dict[str, set]:
+    """
+    Build a reverse dependency graph from `business_services.depends_on`.
+
+    For each service, the graph maps it to the set of services that name it
+    (directly) in their own `depends_on` column. `depends_on` may list more than
+    one dependency separated by commas. This is the real DAG described in the
+    project's own "future improvement" write-up — a service's blast radius is
+    everything that transitively depends on it, not an attribute anyone typed in.
+    """
+    graph: Dict[str, set] = {}
+    for _, row in services.iterrows():
+        service = _text(row.get("business_service")).strip()
+        if not service:
+            continue
+        graph.setdefault(service, set())
+        depends_on_raw = _text(row.get("depends_on"))
+        for dependency in (d.strip() for d in depends_on_raw.split(",")):
+            if not dependency:
+                continue
+            graph.setdefault(dependency, set()).add(service)
+    return graph
+
+
+def compute_downstream_dependency_counts(services: pd.DataFrame) -> Dict[str, int]:
+    """
+    For every service, count how many other services would be impacted
+    (directly or transitively) if it went down.
+
+    A visited-set BFS is used rather than a strict topological sort so a data
+    entry error that accidentally creates a dependency cycle degrades to a
+    bounded, finite count instead of an infinite loop or a crash.
+    """
+    graph = build_service_dependents_graph(services)
+    counts: Dict[str, int] = {}
+    for service in graph:
+        visited: set = set()
+        queue: deque = deque(graph.get(service, ()))
+        while queue:
+            candidate = queue.popleft()
+            if candidate in visited or candidate == service:
+                continue
+            visited.add(candidate)
+            queue.extend(graph.get(candidate, ()))
+        counts[service] = len(visited)
+    return counts
+
+
+def _exploitability_proxy(internet_facing: bool, exploit_available: bool, auth_required: bool) -> float:
+    """
+    Approximate the CVSS v3.1 Exploitability sub-score from fields this dataset
+    actually has, since no full CVSS vector string is provided.
+
+    Uses the official published CVSS v3.1 base-metric weights and the official
+    formula (Exploitability = 8.22 x AV x AC x PR x UI). Three of the four
+    metrics are proxied from real columns; the fourth (User Interaction) has no
+    equivalent column in this dataset and is held at "None" (0.85) as a
+    documented, constant assumption rather than invented per-row.
+
+      Attack Vector        -> internet-facing maps to Network (0.85), else Local (0.55)
+      Attack Complexity     -> a known/public exploit maps to Low (0.77), else High (0.44)
+      Privileges Required   -> no auth required maps to None (0.85), else Low (0.62)
+      User Interaction       -> held constant at None (0.85); not present in this dataset
+
+    This is a deterministic, reproducible engineered feature computed from real
+    data, not a randomly simulated column — the same inputs always give the same
+    output, and every assumption behind it is stated above rather than hidden.
+    """
+    attack_vector = 0.85 if internet_facing else 0.55
+    attack_complexity = 0.77 if exploit_available else 0.44
+    privileges_required = 0.85 if not auth_required else 0.62
+    user_interaction = 0.85
+    return round(8.22 * attack_vector * attack_complexity * privileges_required * user_interaction, 3)
+
+
+def _remediation_effort_rank(patch_available: bool) -> int:
+    """
+    Ascending effort ordinal used only as a tie-breaker: 0 means a vendor patch
+    is available (quick fix), 1 means it is not (compensating controls or an
+    architectural workaround are required instead).
+    """
+    return 0 if patch_available else 1
+
+
 class RiskEngine:
     """
     Deterministic composite risk scorer.
@@ -1100,6 +1201,9 @@ class RiskEngine:
         for campaign in pack.campaigns:
             for key in campaign.cve_keys:
                 self._campaigns_by_key.setdefault(key, []).append(campaign)
+        self._downstream_counts: Dict[str, int] = compute_downstream_dependency_counts(
+            pack.business_services
+        )
 
     # -- individual factor resolution --------------------------------------
 
@@ -1292,6 +1396,19 @@ class RiskEngine:
                 for r in intel_rows
             ]
 
+            auth_required_flag = _is_yes(vuln.get("auth_required"))
+            exploitability_score = _exploitability_proxy(
+                internet_facing=internet_factor.active,
+                exploit_available=_is_yes(vuln.get("exploit_available")),
+                auth_required=auth_required_flag,
+            )
+            downstream_dependency_count = self._downstream_counts.get(
+                _text(asset.get("business_service")).strip(), 0
+            )
+            remediation_effort_rank = _remediation_effort_rank(
+                patch_available=_is_yes(vuln.get("patch_available"))
+            )
+
             parts = {
                 "asset_name": _text(asset.get("asset_name"), _text(asset.get("asset_id"))),
                 "cve_display": _text(vuln.get("cve_display")),
@@ -1356,6 +1473,9 @@ class RiskEngine:
                     composite_score=composite,
                     severity_band=severity_from_score(composite),
                     justification=_build_justification(parts),
+                    exploitability_score=exploitability_score,
+                    downstream_dependency_count=downstream_dependency_count,
+                    remediation_effort_rank=remediation_effort_rank,
                 )
             )
 
@@ -1363,9 +1483,25 @@ class RiskEngine:
         quality.kev_matches = sum(1 for r in risks if r.kev_listed)
         quality.campaign_matches = sum(1 for r in risks if r.campaign_matches)
 
-        # Deterministic ordering: score desc, CVSS desc, CVE asc, then vuln_id asc
-        # so ties never depend on input file order.
-        risks.sort(key=lambda r: (-r.composite_score, -r.cvss, r.cve_display, r.vuln_id))
+        # Deterministic base ordering, in cascade order: composite score, then
+        # CVSS exploitability proxy, then blast radius (downstream dependents),
+        # then remediation effort (patch available wins), then CVSS/CVE/vuln_id
+        # as a final guaranteed-unique tie-break so this list is always a total
+        # order on its own, with no LLM involved. resolve_llm_tie_breaks() may
+        # later reorder only the exact-deadlock groups that fall within the
+        # reported Top N, replacing the CVSS/CVE fallback there with reasoned
+        # triage — everything else in this ordering is untouched by that step.
+        risks.sort(
+            key=lambda r: (
+                -r.composite_score,
+                -r.exploitability_score,
+                -r.downstream_dependency_count,
+                r.remediation_effort_rank,
+                -r.cvss,
+                r.cve_display,
+                r.vuln_id,
+            )
+        )
         for index, risk in enumerate(risks, start=1):
             risk.rank = index
         return risks
@@ -1768,6 +1904,36 @@ class GroqSummariser:
         except Exception as exc:
             self.status = f"Groq client init failed ({exc}); showing retrieved NIST text verbatim"
 
+    def complete(
+        self, system_prompt: str, user_prompt: str, temperature: float = 0.1, max_tokens: int = 320
+    ) -> Optional[str]:
+        """
+        Low-level Groq chat call shared by NIST summarisation and tie-break triage.
+
+        Returns None on any failure (missing client, network error, rate limit,
+        empty response) so callers can implement their own deterministic fallback
+        rather than this method deciding what "no answer" means for them.
+        """
+        if not self.available or self._client is None:
+            return None
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=GROQ_TIMEOUT_SECONDS,
+            )
+            text = _text(response.choices[0].message.content)
+            return text or None
+        except Exception as exc:
+            LOGGER.warning("Groq call failed: %s", exc)
+            self.status = f"Groq call failed ({type(exc).__name__}); showing retrieved NIST text verbatim"
+            return None
+
     def summarise(self, risk_context: str, control: NistControl) -> Tuple[str, str]:
         """
         Summarise a retrieved control.
@@ -1790,25 +1956,10 @@ class GroqSummariser:
             f"Control text: {control.control_text[:4000]}\n"
             f"Discussion: {control.discussion[:3000]}\n"
         )
-        try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": GROQ_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                max_tokens=320,
-                timeout=GROQ_TIMEOUT_SECONDS,
-            )
-            text = _text(response.choices[0].message.content)
-            if not text:
-                return verbatim, "nist_verbatim"
-            return text, "groq"
-        except Exception as exc:
-            LOGGER.warning("Groq summarisation failed for %s: %s", control.control_id, exc)
-            self.status = f"Groq call failed ({type(exc).__name__}); showing retrieved NIST text verbatim"
+        text = self.complete(GROQ_SYSTEM_PROMPT, user_prompt, temperature=0.1, max_tokens=320)
+        if not text:
             return verbatim, "nist_verbatim"
+        return text, "groq"
 
     @staticmethod
     def _verbatim(control: NistControl) -> str:
@@ -1817,6 +1968,265 @@ class GroqSummariser:
         if control.discussion.strip():
             body = f"{body}\n\nDiscussion: {control.discussion.strip()}"
         return body[:2400].strip() or "Retrieved control contains no prose text."
+
+
+# ---------------------------------------------------------------------------
+# Tie-break cascade
+# ---------------------------------------------------------------------------
+#
+# composite_score already reflects CVSS x every deterministic multiplier and is
+# never touched again below. The functions in this section only decide ORDER
+# among risks that are already exactly equal on composite_score (and, going
+# further down the cascade, equal on every quantitative tie-break key too).
+# Nothing here can change what a risk's score is, only where an equally-scored
+# risk lands relative to another equally-scored risk.
+
+TIE_BREAK_SYSTEM_PROMPT = """You are a security triage agent called in only when two vulnerabilities are in an exact deadlock: identical composite risk score, identical exploitability estimate, identical blast radius (count of downstream dependent business services), and identical remediation effort.
+
+You will be given the JSON context for both. Decide which one a security team should fix first.
+
+Hard rules:
+- Do not invent, assume, or state any fact that is not present in the JSON you were given.
+- Do not state, alter, or imply any change to either risk's composite score, CVSS, or rank.
+- Base your decision only on legitimate operational signals already present in the context: what the asset name and data classification imply about sensitive data, business impact text, compliance scope, customer-facing status, and similar qualitative context the deterministic scoring engine could not weigh.
+- Respond with strict JSON only, no markdown code fences, no preamble, no explanation outside the JSON: {"first_vuln_id": "<id>", "justification": "<one sentence, under 30 words>"}
+- "first_vuln_id" must be exactly one of the two vuln_id values you were given, copied verbatim.
+"""
+
+
+def _risk_tie_context(risk: "Risk") -> Dict[str, Any]:
+    """Build the JSON-serialisable context handed to the LLM tie-break prompt."""
+    return {
+        "vuln_id": risk.vuln_id,
+        "cve": risk.cve_display,
+        "asset_name": risk.asset_name,
+        "asset_type": risk.asset_type,
+        "data_classification": risk.data_classification,
+        "business_service": risk.business_service,
+        "business_impact": risk.business_impact,
+        "compliance_scope": risk.compliance_scope,
+        "customer_facing": risk.customer_facing,
+        "owner_team": risk.owner_team,
+        "vulnerability_name": risk.vulnerability_name,
+        "affected_component": risk.affected_component,
+        "composite_score": risk.composite_score,
+        "exploitability_score": risk.exploitability_score,
+        "downstream_dependency_count": risk.downstream_dependency_count,
+        "remediation_effort_rank": risk.remediation_effort_rank,
+    }
+
+
+def _deterministic_pair_winner(risk_a: "Risk", risk_b: "Risk") -> "Risk":
+    """CVSS desc, then CVE asc, then vuln_id asc — the ultimate, always-available tie-break."""
+    ordered = sorted((risk_a, risk_b), key=lambda r: (-r.cvss, r.cve_display, r.vuln_id))
+    return ordered[0]
+
+
+def llm_tie_breaker(
+    risk_a: "Risk",
+    risk_b: "Risk",
+    summariser: Optional["GroqSummariser"] = None,
+) -> Dict[str, str]:
+    """
+    Ask the LLM to break an exact deadlock between two equally-scored risks.
+
+    This is the only function in the whole pipeline where an LLM's output can
+    influence the final displayed order of risks. It never touches
+    composite_score, CVSS, or any multiplier: it only decides which of two
+    already-tied risks is listed first, and that decision — plus the reason for
+    it — is always recorded on both Risk objects for display, never applied
+    silently.
+
+    Parameters
+    ----------
+    risk_a, risk_b
+        The two risks that are deadlocked after the deterministic cascade.
+    summariser
+        An existing GroqSummariser to reuse. If omitted, one is constructed from
+        the GROQ_API_KEY environment variable, so this function is directly
+        callable on its own as requested, not only from inside the pipeline.
+
+    Returns
+    -------
+    A dict with 'first_vuln_id', 'justification', and 'source'
+    ('llm_triage' on success, 'deterministic_fallback' otherwise).
+
+    Never raises. Any failure — missing key, missing package, network error,
+    malformed response, or a response that names neither risk — degrades to the
+    deterministic CVSS/CVE ordering, so ranking is never blocked on the LLM
+    being reachable.
+    """
+    fallback_winner = _deterministic_pair_winner(risk_a, risk_b)
+    fallback = {
+        "first_vuln_id": fallback_winner.vuln_id,
+        "justification": (
+            "AI triage was unavailable or inconclusive; ordered by CVSS then CVE "
+            f"as the deterministic fallback ({fallback_winner.cve_display})."
+        ),
+        "source": "deterministic_fallback",
+    }
+
+    active_summariser = summariser or GroqSummariser(api_key=os.environ.get("GROQ_API_KEY", ""))
+    if not active_summariser.available:
+        return fallback
+
+    user_prompt = json.dumps(
+        {"risk_a": _risk_tie_context(risk_a), "risk_b": _risk_tie_context(risk_b)},
+        indent=2,
+    )
+
+    text = active_summariser.complete(
+        TIE_BREAK_SYSTEM_PROMPT, user_prompt, temperature=0.0, max_tokens=150
+    )
+    if not text:
+        return fallback
+
+    try:
+        cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        parsed = json.loads(cleaned)
+        winner_id = _text(parsed.get("first_vuln_id"))
+        justification = _text(parsed.get("justification"), "No justification returned.")
+    except (json.JSONDecodeError, AttributeError) as exc:
+        LOGGER.warning(
+            "LLM tie-break returned unparseable JSON for %s vs %s: %s",
+            risk_a.vuln_id, risk_b.vuln_id, exc,
+        )
+        return fallback
+
+    valid_ids = {risk_a.vuln_id, risk_b.vuln_id}
+    if winner_id not in valid_ids:
+        LOGGER.warning(
+            "LLM tie-break named an unrecognised vuln_id ('%s') for %s vs %s; using fallback.",
+            winner_id, risk_a.vuln_id, risk_b.vuln_id,
+        )
+        return fallback
+
+    return {"first_vuln_id": winner_id, "justification": justification, "source": "llm_triage"}
+
+
+def _cascade_tie_key(risk: "Risk") -> Tuple[float, float, int, int]:
+    """The four quantitative tie-break keys, ignoring the CVSS/CVE final fallback."""
+    return (
+        risk.composite_score,
+        risk.exploitability_score,
+        risk.downstream_dependency_count,
+        risk.remediation_effort_rank,
+    )
+
+
+def resolve_llm_tie_breaks(
+    risks: List["Risk"],
+    top_n: int,
+    summariser: Optional["GroqSummariser"] = None,
+    use_llm: bool = True,
+    max_group_size: int = 6,
+) -> List["Risk"]:
+    """
+    Resolve exact deadlocks that fall within the reported Top N using LLM triage,
+    leaving everything else in `risks` in the deterministic order it already had.
+
+    `risks` must already be sorted by RiskEngine.score_all()'s full cascade
+    (composite score, exploitability, blast radius, remediation effort, then the
+    CVSS/CVE/vuln_id fallback), which is a valid, fully deterministic total order
+    on its own. This function only looks for contiguous groups that are exactly
+    tied on the first four keys (ignoring the CVSS/CVE fallback that separated
+    them) and, only when such a group overlaps the Top N, asks the LLM to reorder
+    that group. Ties below the Top N cutoff are left on the deterministic order
+    without spending an API call on a ranking nobody will read.
+
+    Every risk in a tied group — resolved by the LLM or not — gets its
+    `tie_break_source` and `tie_break_note` set, so the UI can always explain
+    why the final order is what it is.
+    """
+    if not risks:
+        return risks
+
+    groups: List[List["Risk"]] = []
+    current: List["Risk"] = [risks[0]]
+    for risk in risks[1:]:
+        if _cascade_tie_key(risk) == _cascade_tie_key(current[-1]):
+            current.append(risk)
+        else:
+            groups.append(current)
+            current = [risk]
+    groups.append(current)
+
+    resolved: List["Risk"] = []
+    position = 0
+    cache: Dict[frozenset, Dict[str, str]] = {}
+
+    for group in groups:
+        group_start = position
+        overlaps_report = group_start < max(0, int(top_n)) and len(group) > 1
+
+        if not overlaps_report:
+            if len(group) > 1:
+                for risk in group:
+                    risk.tie_break_source = "deterministic_not_evaluated"
+                    risk.tie_break_note = (
+                        "Tied on score, exploitability, blast radius and remediation "
+                        "effort, but this group falls outside the reported Top N, so "
+                        "AI triage was skipped and the CVSS/CVE order was kept."
+                    )
+            resolved.extend(group)
+            position += len(group)
+            continue
+
+        if not use_llm or len(group) > max_group_size:
+            reason = (
+                "AI triage is disabled for this run."
+                if not use_llm
+                else f"AI triage was skipped because {len(group)} risks were tied at once "
+                     f"(limit {max_group_size}); ordered by CVSS then CVE instead."
+            )
+            for risk in group:
+                risk.tie_break_source = "deterministic_fallback"
+                risk.tie_break_note = reason
+            resolved.extend(group)
+            position += len(group)
+            continue
+
+        def _comparator(a: "Risk", b: "Risk") -> int:
+            key = frozenset((a.vuln_id, b.vuln_id))
+            if key not in cache:
+                cache[key] = llm_tie_breaker(a, b, summariser)
+            outcome = cache[key]
+            if outcome["first_vuln_id"] == a.vuln_id:
+                return -1
+            if outcome["first_vuln_id"] == b.vuln_id:
+                return 1
+            return 0
+
+        try:
+            group_sorted = sorted(group, key=functools.cmp_to_key(_comparator))
+        except Exception as exc:
+            LOGGER.warning("LLM tie-break group resolution failed at rank %s: %s", group_start + 1, exc)
+            group_sorted = group
+            for risk in group_sorted:
+                risk.tie_break_source = "deterministic_fallback_error"
+                risk.tie_break_note = "AI triage raised an error; ordered by CVSS then CVE as a safe fallback."
+            resolved.extend(group_sorted)
+            position += len(group)
+            continue
+
+        for risk in group_sorted:
+            note = None
+            for other in group_sorted:
+                if other is risk:
+                    continue
+                candidate_key = frozenset((risk.vuln_id, other.vuln_id))
+                if candidate_key in cache:
+                    note = cache[candidate_key]
+                    break
+            if note is not None:
+                risk.tie_break_source = note.get("source", "llm_triage")
+                risk.tie_break_note = note.get("justification", "")
+        resolved.extend(group_sorted)
+        position += len(group)
+
+    for index, risk in enumerate(resolved, start=1):
+        risk.rank = index
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -2026,7 +2436,8 @@ def generate_risk_report(
     groq_api_key: Optional[str] = None,
 ) -> RiskReport:
     """
-    Run the full pipeline: load -> validate -> join -> score -> rank -> retrieve -> summarise.
+    Run the full pipeline: load -> validate -> join -> score -> rank ->
+    resolve tie-breaks -> retrieve -> summarise.
 
     Parameters
     ----------
@@ -2048,18 +2459,20 @@ def generate_risk_report(
 
     engine = RiskEngine(pack)
     all_risks = engine.score_all()
-    top_risks = all_risks[: max(0, int(top_n))]
-
-    nist_engine = NistRagEngine(pack.nist_catalog)
-    nist_engine.build_index()
-
-    hint_matcher = RemediationHintMatcher(pack.remediation_guidance)
 
     if use_llm:
         summariser = GroqSummariser(api_key=groq_api_key)
     else:
         summariser = GroqSummariser(api_key="")
         summariser.status = "LLM summarisation disabled by user; showing retrieved NIST text verbatim"
+
+    all_risks = resolve_llm_tie_breaks(all_risks, top_n=top_n, summariser=summariser, use_llm=use_llm)
+    top_risks = all_risks[: max(0, int(top_n))]
+
+    nist_engine = NistRagEngine(pack.nist_catalog)
+    nist_engine.build_index()
+
+    hint_matcher = RemediationHintMatcher(pack.remediation_guidance)
 
     enrich_with_nist(top_risks, nist_engine, hint_matcher, summariser)
 

@@ -750,6 +750,15 @@ def render_risk_card(risk: Risk) -> None:
         st.markdown("**Why this ranks here**")
         st.markdown(f'<div class="tp-why">{risk.justification}</div>', unsafe_allow_html=True)
 
+        if risk.tie_break_note:
+            provenance_label = {
+                "llm_triage": "AI triage broke this tie",
+                "deterministic_fallback": "Deterministic fallback (CVSS/CVE order)",
+                "deterministic_fallback_error": "AI triage failed — deterministic fallback used",
+                "deterministic_not_evaluated": "Tied, but outside the reported Top N",
+            }.get(risk.tie_break_source or "", risk.tie_break_source or "Tie-break applied")
+            st.caption(f"⚖️ {provenance_label}: {risk.tie_break_note}")
+
         st.markdown("**Recommended NIST SP 800-53 control**")
         render_nist(risk)
 
