@@ -93,11 +93,28 @@ a plain-English justification sentence, and the recommended NIST control.
       │            × EDR coverage           (1.5 absent / 1.0 present)      │
       │                                                                     │
       │  no cap, no normalisation → full dynamic range preserved            │
-      │  rank by score desc, CVSS desc, CVE asc, vuln_id asc                │
+      │  base rank: score desc, exploitability desc, blast radius desc,     │
+      │           remediation effort asc, CVSS desc, CVE asc, vuln_id asc   │
       │  every multiplier retained on the risk object for lineage           │
       └─────────────────────────────────────────────────────────────────────┘
                                           │
-                        Top 5 ranked risks │ (ranking already final)
+              Base ranking (4-step cascade completed) │ 
+                                          ▼
+      ┌─────────────────────────────────────────────────────────────────────┐
+      │  TIE-BREAK RESOLVER        resolves exact deadlocks in Top N only   │
+      │                                                                     │
+      │  Groups exact ties on:   composite score, exploitability,           │
+      │                          blast radius, remediation effort           │
+      │                                                                     │
+      │  If group falls in Top N and size ≤ 6:  invoke Groq LLM as          │
+      │  security triage agent, request unstructured qualitative ranking    │
+      │  (e.g., PII proximity, compliance scope, customer impact).          │
+      │  Falls back to deterministic CVSS/CVE order on any failure.         │
+      │                                                                     │
+      │  Every tie-break decision recorded on the Risk object.              │
+      └─────────────────────────────────────────────────────────────────────┘
+                                          │
+                        Top 5 (after tie-break resolution) │
                                           ▼
       ┌─────────────────────────────────────────────────────────────────────┐
       │  NIST RETRIEVAL (RAG)                                               │
@@ -285,9 +302,85 @@ Vulnerabilities with a status of Closed, Remediated, Resolved, Fixed, Mitigated 
 Positive are excluded from ranking and counted in the diagnostics panel, so a fixed
 finding can never occupy a board-level slot.
 
+### Tie-breaker cascade — when composite scores tie
+
+When multiple risks have an **identical composite score**, the system applies a deterministic
+4-step cascade to decide their order. This ensures the security team knows exactly which one
+to fix first, without ever relying on input file order or arbitrary factors.
+
+#### Step 1: CVSS Exploitability Sub-Score (descending)
+
+If composites are equal, compare the **exploitability of the vulnerability itself**, computed
+from three signals already in your data:
+
+```
+exploitability = 8.22 × AV × AC × PR × UI
+
+where:
+  AV (Attack Vector)    = 0.85 if internet-facing, else 0.55
+  AC (Attack Complexity) = 0.77 if exploit is available, else 0.44
+  PR (Privileges Required) = 0.85 if auth is not required, else 0.62
+  UI (User Interaction) = 0.85 (constant, not present in this dataset)
+```
+
+This is the official CVSS v3.1 formula with engineered feature inputs. A vulnerability
+that requires no authentication on an internet-facing asset ranks above one that requires
+admin privileges on an internal network, even if their composite scores are identical.
+
+#### Step 2: Blast Radius — Downstream Dependency Count (descending)
+
+If still tied, compare **how many downstream business services would be impacted** if the
+asset were fully compromised. The system builds the dependency DAG from 
+`business_services.depends_on` at load time and counts transitive dependents via BFS.
+
+A vulnerability on a service that 15 other services depend on ranks above one on an
+isolated service, reflecting the fact that blast radius matters.
+
+#### Step 3: Remediation Effort (ascending)
+
+If still tied, prioritize vulnerabilities with **a vendor patch available** (effort rank 0)
+over those requiring compensating controls or architectural changes (effort rank 1).
+
+This acknowledges that quick wins matter when everything else is equal.
+
+#### Step 4: LLM Triage Agent (fallback, for exact 4-way deadlocks in Top N only)
+
+If all four steps above produce a perfect tie — a vanishingly rare scenario — and the
+tied group falls within your reported Top N and contains 6 or fewer risks, the system
+invokes an **LLM as a security triage agent** to make a final decision.
+
+The LLM receives the JSON context of both deadlocked risks and is asked to evaluate
+**unstructured qualitative signals** that pure math cannot weight:
+
+- **PII or sensitive data proximity:** Does the asset name or data classification hint
+  at customer data, payment info, or credentials?
+- **Business impact text:** What does the service owner's description say about the
+  consequence of downtime?
+- **Compliance scope:** Is this service subject to regulatory obligations like PCI DSS
+  or GDPR that raise urgency?
+- **Customer-facing status:** Is this a direct revenue or brand impact, or an
+  internal support asset?
+
+**Critical safety nets:**
+
+- The LLM **never sees or modifies the composite score, CVSS, or any multiplier** — it
+  only decides order between already-tied risks.
+- The LLM call **only happens for exact deadlocks** that clear all four deterministic keys
+  and fall in the Top N. Ties outside the Top N are left in deterministic order without an
+  API call.
+- If the LLM fails (malformed JSON, hallucinated vuln_id, network error, missing key), the
+  system **automatically falls back to deterministic CVSS/CVE ordering** with a logged
+  warning — ranking never blocks on the LLM being reachable.
+- Every tie-break decision — LLM or deterministic — is **recorded on the Risk object** and
+  displayed in the UI with a `⚖️` label and a one-sentence note, so nothing happens silently.
+
+**Guarantee:** If you remove the `GROQ_API_KEY` environment variable, the system produces
+the **exact same ranking** — it just uses the CVSS/CVE fallback for all tie-breaks instead
+of asking the LLM. Ranking is never non-deterministic.
+
 ---
 
-## 5. Supporting question 1 — the data split
+## 6. Supporting question 1 — the data split
 
 **Queried as structured records:** the asset inventory, vulnerability list, threat
 intelligence feed, business service catalogue and the CISA KEV catalogue. These are
@@ -319,7 +412,7 @@ brief is explicit that the CSV is a hint and NIST is the source.
 
 ---
 
-## 6. Supporting question 2 — three ways this produces wrong output
+## 7. Supporting question 2 — three ways this produces wrong output
 
 ### Failure mode 1 — CVE string normalisation mismatches
 
@@ -424,7 +517,7 @@ with no service label still inherits criticality through what depends on it.
 
 ---
 
-## 7. Supporting question 3 — the one thing I would change
+## 8. Supporting question 3 — the one thing I would change
 
 I would replace the single-hop business-service lookup with a **directed acyclic graph of
 service dependencies and propagate risk along it**. Today criticality is an attribute
@@ -469,7 +562,7 @@ excellent remediation advice attached to it.
 
 ---
 
-## 8. Verification
+## 9. Verification
 
 ```bash
 # deterministic pipeline, no UI, no LLM
@@ -486,7 +579,7 @@ threshold behaviour, not retrieval quality.
 
 Behaviours covered by the checks that shipped with this build:
 
-- Identical ranking across repeated runs on the same data (determinism).
+- Identical ranking across repeated runs on the same data (determinism, including tie-breaks).
 - A missing required column raises a startup error naming the file, the field, its
   accepted aliases and the columns actually present.
 - A missing data directory fails with an actionable message.
@@ -494,10 +587,14 @@ Behaviours covered by the checks that shipped with this build:
 - Vulnerabilities on unknown asset IDs and closed findings are excluded and counted.
 - Retrieval below the distance threshold returns nothing and triggers no LLM call.
 - Filters that produce an empty result set render a prompt rather than an exception.
+- Ties are resolved deterministically when `GROQ_API_KEY` is absent, with the same rank
+  output as if the LLM had been invoked and agreed with the CVSS/CVE fallback order.
+- The 4-step cascade (exploitability, blast radius, remediation effort) correctly orders
+  risks that have identical composite scores.
 
 ---
 
-## 9. Scope and safety
+## 10. Scope and safety
 
 This system is **advisory only**. It reads files and documents. It does not scan, connect
 to production, change configuration, or execute remediation of any kind. Risk scores and
