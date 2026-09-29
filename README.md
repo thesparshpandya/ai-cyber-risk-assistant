@@ -75,7 +75,7 @@ a plain-English justification sentence, and the recommended NIST control.
       │  RELATIONAL JOIN (pandas, exact keys)                               │
       │                                                                     │
       │   Asset ──asset_id──► Vulnerability ──cve_key──► Threat Intel       │
-      │     │                       │                                      │
+      │     │                       │                                       │
       │     │                       └──cve_key──► CISA KEV catalogue        │
       │     │                       └──cve_key──► MDR advisory campaigns    │
       │     └──business_service──► Business Service                         │
@@ -173,7 +173,7 @@ Python 3.11 or newer.
 
 ```bash
 git clone https://github.com/thesparshpandya/ai-cyber-risk-assistant.git
-cd tawasolpay-cyber-risk-assistant
+cd ai-cyber-risk-assistant
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
